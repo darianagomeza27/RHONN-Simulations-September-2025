@@ -399,7 +399,7 @@ def run_simulation():
     
     init_w = []
     for i in range(NUM_NEURONS):
-        init_w.append(np.random.uniform(-0.1, 0.1, NUM_FEATURES_PER_STATE[i]))
+        init_w.append(np.random.uniform(-1.0, 1.0, NUM_FEATURES_PER_STATE[i]))
     
     ekf = EKF_RHONN_Trainer(NUM_NEURONS, NUM_FEATURES_PER_STATE, eta=1.0, initial_weights=init_w)
     ukf = UKF_RHONN_Trainer(NUM_NEURONS, NUM_FEATURES_PER_STATE, eta=1.0, initial_weights=init_w)
