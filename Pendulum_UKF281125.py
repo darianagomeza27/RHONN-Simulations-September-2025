@@ -1,6 +1,7 @@
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import random
 
 # ==========================================
 # 1. Configuration & Constants
@@ -10,15 +11,22 @@ STEPS = 1000
 PROCESS_NOISE_STD = 0.05  # Laplacian Scale
 SHOT_NOISE_PROB = 0.05    # Probability of outlier
 SHOT_NOISE_SCALE = 5.0    # Magnitude of outlier (Large spike)
-NUM_PARTICLES = 800
+MEASUREMENT_NOISE_STD = 0.1  # Added measurement noise
+NUM_PARTICLES = 500
 NUM_NEURONS = 2          # theta, theta_dot
-NUM_FEATURES = 10        # High Order Connections (2nd Order)
+NUM_FEATURES = 8        # High Order Connections (2nd Order)
 SCALE_FACTOR = 1.0       # Not used for linear output
+
+# --- NEW: Process Noise Scaling for Gaussian Filters (Q) ---
+Q_BASE_COV = 1e-6 
+# -----------------------------------------------------------
 
 # ==========================================
 # 2. Math & RHONN Utils
 # ==========================================
 def sigmoid(x):
+    # Added protection against overflow
+    x = np.clip(x, -500, 500)
     return 1.0 / (1.0 + np.exp(-x))
 
 def construct_z_vector(x_state, u_input):
@@ -37,17 +45,15 @@ def construct_z_vector(x_state, u_input):
     su = sigmoid(u)
     
     # High Order Connections (2nd Order Expansion)
-    # [s1, s2, su, s1*s2, s1*su, s2*su, s1^2, s2^2, su^2, 1]
+    # [s1, s2, su, s1*s2, s2*su, s1^2, s2^2, 1]
     return np.array([
         s1,
         s2,
         su,
         s1 * s2,
-        s1 * su,
         s2 * su,
         s1**2,
         s2**2,
-        su**2,
         1.0
     ])
 
@@ -79,7 +85,7 @@ def plant_step(x_k, u_k, dt, noise_std):
     
     # Dynamics: theta_ddot = -g/L sin(theta) - b/(mL^2) theta_dot + 1/(mL^2) u
     
-    # Add noise to input (torque disturbance)
+    # Add noise to input (torque disturbance) - This is the primary heavy-tailed noise source
     torque_noisy = torque + np.random.laplace(0, noise_std)
     
     # Add Shot Noise (Non-Gaussian Outliers)
@@ -89,7 +95,7 @@ def plant_step(x_k, u_k, dt, noise_std):
 
     theta_ddot = -(g/L) * np.sin(theta) - (b/(m*L**2)) * theta_dot + (1.0/(m*L**2)) * torque_noisy
     
-    # Add noise to state derivatives
+    # Add secondary small noise to state derivatives for observation uncertainty
     theta_dot_noisy = theta_dot + np.random.laplace(0, noise_std * 0.1)
     theta_ddot_noisy = theta_ddot + np.random.laplace(0, noise_std * 0.1)
     
@@ -116,11 +122,11 @@ class EKF_RHONN_Trainer:
 
         # Covariance Matrices (One per neuron for independence)
         self.P = [np.eye(num_features) * 1.0 for _ in range(num_neurons)]
-        self.Q = [np.eye(num_features) * 1e-4 for _ in range(num_neurons)]
+        self.Q = [np.eye(num_features) * Q_BASE_COV for _ in range(num_neurons)]
         self.R = [0.01 for _ in range(num_neurons)] # Scalar measurement noise
 
     def update(self, chi_kp1, chi_k, u_k, x_hat_prev):
-        # Parallel: Use Estimated state from k
+        # Use Estimated state from k (x_hat_k) for Z vector
         x_state_z = x_hat_prev
         z = construct_z_vector(x_state_z, u_k)
         
@@ -132,13 +138,16 @@ class EKF_RHONN_Trainer:
             P_pred = self.P[i] + self.Q[i]
             
             # 2. Kalman Gain
-            # Linearized H = Jacobian of NN w.r.t weights
+            # H = z (Jacobian of NN w.r.t weights)
             H = rhonn_predict_jacobian(z, self.weights[i])
             
-            # M = R + H.T * P * H
+            # PH = P_pred * H
             PH = P_pred @ H
+            
+            # M = R + H.T * P * H
             M = self.R[i] + H @ PH
             
+            # K = PH / M
             K = PH / (M + 1e-12)
             
             # 3. Update Weights
@@ -170,8 +179,8 @@ class PF_RHONN_Trainer:
         self.num_neurons = num_neurons
         
         # Hyperparameters
-        self.Q_std = 0.05  # Diffusion
-        self.R_var = 0.05  # Likelihood Scaling
+        self.Q_std = 0.5  # Diffusion
+        self.R_var = 0.5  # Likelihood Scaling (Laplacian scale factor)
         self.ess_threshold = n_particles / 2.0
         
         # Particles: [neurons, particles, features]
@@ -180,8 +189,9 @@ class PF_RHONN_Trainer:
         
         for i in range(num_neurons):
             base_w = initial_weights[i] if initial_weights is not None else np.random.randn(num_features)*0.1
-            # Initialize particles around base weights
-            p_i = base_w + np.random.randn(n_particles, num_features) * 0.1
+            
+            # Initial particle spread
+            p_i = base_w + np.random.randn(n_particles, num_features) * 0.01
             self.particles.append(p_i)
             self.weights_pf.append(np.ones(n_particles) / n_particles)
 
@@ -204,7 +214,6 @@ class PF_RHONN_Trainer:
             
             innov = target_delta[i] - preds
             
-            # *** ACADEMIC ADVANTAGE ***
             # Use Laplacian Likelihood (exp(-|error|)) instead of Gaussian (exp(-error^2))
             log_likelihood = -np.abs(innov) / self.R_var
             
@@ -215,6 +224,7 @@ class PF_RHONN_Trainer:
             # Normalize
             w_sum = np.sum(self.weights_pf[i])
             if w_sum < 1e-300:
+                # If weights collapse, reset to uniform (resilience to collapse)
                 self.weights_pf[i] = np.ones(self.n_particles) / self.n_particles
             else:
                 self.weights_pf[i] /= w_sum
@@ -229,7 +239,7 @@ class PF_RHONN_Trainer:
         particles = self.particles[idx]
         N = self.n_particles
         
-        # Systematic Resampling
+        # Systematic Resampling (more efficient than multinomial)
         positions = (np.arange(N) + np.random.random()) / N
         indexes = np.zeros(N, 'i')
         cumulative_sum = np.cumsum(weights)
@@ -279,7 +289,7 @@ class UKF_RHONN_Trainer:
 
         # Covariance Matrices
         self.P = [np.eye(num_features) * 1.0 for _ in range(num_neurons)]
-        self.Q = [np.eye(num_features) * 1e-4 for _ in range(num_neurons)]
+        self.Q = [np.eye(num_features) * Q_BASE_COV for _ in range(num_neurons)]
         self.R = [0.01 for _ in range(num_neurons)]
 
         # Weights for sigma points
@@ -299,9 +309,11 @@ class UKF_RHONN_Trainer:
         sigma_points[0] = w
         
         try:
+            # Cholesky decomposition for matrix square root
             sqrt_P = np.linalg.cholesky((self.n + self.lam) * P)
         except np.linalg.LinAlgError:
-            P_stable = P + np.eye(self.n) * 1e-6
+            # Jitter for stability
+            P_stable = P + np.eye(self.n) * 1e-6 
             sqrt_P = np.linalg.cholesky((self.n + self.lam) * P_stable)
 
         for i in range(self.n):
@@ -343,12 +355,16 @@ class UKF_RHONN_Trainer:
                 Pxy += self.Wc[j] * (sigmas[j] - w_pred) * (y_sigmas[j] - y_pred)
                 
             # 4. Update Step (Measurement Update)
-            K = Pxy / (Py + 1e-12)
+            K = Pxy / (Py + 1e-12) # Kalman Gain
             
             innovation = target_delta[i] - y_pred
             
+            # w = w + eta * K * innovation
             self.weights[i] = w_pred + self.eta * K * innovation
+            
+            # P = P - K * Py * K.T
             self.P[i] = P_pred - np.outer(K, K) * Py
+            self.P[i] = 0.5 * (self.P[i] + self.P[i].T) # Symmetrize
 
     def get_estimate(self, chi_k, u_k):
         x_state_z = chi_k
@@ -360,11 +376,20 @@ class UKF_RHONN_Trainer:
 # 7. Main Simulation Loop
 # ==========================================
 def run_simulation():
+    # np.random.seed(42)
+    # random.seed(42)
+    
     # History containers
     h_true = np.zeros((STEPS, NUM_NEURONS))
     h_ekf = np.zeros((STEPS, NUM_NEURONS))
     h_ukf = np.zeros((STEPS, NUM_NEURONS))
     h_pf = np.zeros((STEPS, NUM_NEURONS))
+    h_measured = np.zeros((STEPS, NUM_NEURONS))
+    
+    # Weights History
+    h_ekf_w = np.zeros((STEPS, NUM_NEURONS, NUM_FEATURES))
+    h_ukf_w = np.zeros((STEPS, NUM_NEURONS, NUM_FEATURES))
+    h_pf_w = np.zeros((STEPS, NUM_NEURONS, NUM_FEATURES))
     
     # Initial State [theta, theta_dot]
     x_true = np.array([np.pi/2, 0.0]) # Start at 90 degrees
@@ -376,6 +401,7 @@ def run_simulation():
     h_ekf[0] = x_ekf
     h_ukf[0] = x_ukf
     h_pf[0] = x_pf
+    h_measured[0] = x_true + np.random.normal(0, MEASUREMENT_NOISE_STD, size=2)
     
     # Initial Weights (Shared)
     init_w = np.random.uniform(-0.1, 0.1, (NUM_NEURONS, NUM_FEATURES))
@@ -386,32 +412,36 @@ def run_simulation():
     pf = PF_RHONN_Trainer(NUM_NEURONS, NUM_FEATURES, NUM_PARTICLES, initial_weights=init_w)
     
     print(f"Starting Pendulum Simulation: {STEPS} steps")
-    print(f"Noise Type: Laplacian (Scale={PROCESS_NOISE_STD}) + Shot Noise (Prob={SHOT_NOISE_PROB}, Scale={SHOT_NOISE_SCALE})")
-    print(f"EKF Assumption: Gaussian (Standard parameters)")
-    print(f"UKF Assumption: Gaussian (Unscented Transform)")
-    print(f"PF Assumption: Laplacian (Matched Likelihood)")
+    print(f"Process Noise: Laplacian (Scale={PROCESS_NOISE_STD}) + Shot Noise (Prob={SHOT_NOISE_PROB}, Scale={SHOT_NOISE_SCALE})")
+    print(f"Measurement Noise: Gaussian (Std={MEASUREMENT_NOISE_STD})")
+    print(f"EKF/UKF Assumption: Gaussian (Q_BASE_COV={Q_BASE_COV})")
+    print(f"PF Assumption: Laplacian Likelihood (Matched Filter)")
     
     for k in range(STEPS - 1):
-        t = k * DT
-        
         # 1. Controls (Torque)
-        # Sinusoidal input to excite dynamics
-        torque = 2.0 * np.sin(2.0 * t)
+        # No input to trace normal behavior (Free response)
+        torque = 0.0
         u = np.array([torque])
         
-        # 2. Plant Step
+        # 2. Plant Step (Gives the TRUE next state)
         x_next_true = plant_step(x_true, u, DT, PROCESS_NOISE_STD)
         
+        # CRITICAL FIX: Add measurement noise to create divergence between methods
+        # Each filter now sees a noisy measurement, not the true state
+        measurement_noise = np.random.normal(0, MEASUREMENT_NOISE_STD, size=2)
+        x_measured = x_next_true + measurement_noise
+        
         # 3. EKF Update & Predict
-        ekf.update(x_next_true, x_true, u, x_ekf)
+        # CRITICAL FIX: Use own previous estimate for Z vector calculation
+        ekf.update(x_measured, x_ekf, u, x_ekf)
         x_next_ekf = ekf.get_estimate(x_ekf, u)
         
         # 4. UKF Update & Predict
-        ukf.update(x_next_true, x_true, u, x_ukf)
+        ukf.update(x_measured, x_ukf, u, x_ukf)
         x_next_ukf = ukf.get_estimate(x_ukf, u)
         
         # 5. PF Update & Predict
-        pf.update(x_next_true, x_true, u, x_pf)
+        pf.update(x_measured, x_pf, u, x_pf)
         x_next_pf = pf.get_estimate(x_pf, u)
         
         # 6. Advance
@@ -424,38 +454,75 @@ def run_simulation():
         h_ekf[k+1] = x_ekf
         h_ukf[k+1] = x_ukf
         h_pf[k+1] = x_pf
+        h_measured[k+1] = x_measured
+        
+        # Store Weights
+        h_ekf_w[k+1] = ekf.weights
+        h_ukf_w[k+1] = ukf.weights
+        for i in range(NUM_NEURONS):
+            # Store the weighted average weight vector for the PF
+            h_pf_w[k+1, i] = np.average(pf.particles[i], weights=pf.weights_pf[i], axis=0)
 
     # ==========================================
     # 8. Visualization
     # ==========================================
     # Create subplots
-    fig = make_subplots(rows=2, cols=1, 
-                        subplot_titles=("Pendulum Angle (Theta): EKF vs UKF vs PF (with Shot Noise)", "Mean Squared Error over Time"),
-                        vertical_spacing=0.15)
+    fig = make_subplots(rows=4, cols=1, 
+                        subplot_titles=("Pendulum Angle (Theta)", "Pendulum Velocity (Theta_dot)", "Mean Squared Error (Full State)", "Weights Norm Evolution (Neuron 1)"),
+                        vertical_spacing=0.08)
 
-    # Plotting Trajectory (Theta)
+    # 1. Angle
     fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_true[:, 0], mode='lines', name='True Angle', line=dict(color='green', width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ekf[:, 0], mode='lines', name='EKF', line=dict(color='red', width=1, dash='dash')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ukf[:, 0], mode='lines', name='UKF', line=dict(color='orange', width=1, dash='dashdot')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_pf[:, 0], mode='lines', name='PF', line=dict(color='blue', width=1.5, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_measured[:, 0], mode='markers', name='Measured', marker=dict(color='gray', size=2, opacity=0.3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ekf[:, 0], mode='lines', name='EKF Angle', line=dict(color='red', width=1, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ukf[:, 0], mode='lines', name='UKF Angle', line=dict(color='orange', width=1, dash='dashdot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_pf[:, 0], mode='lines', name='PF Angle', line=dict(color='blue', width=1.5, dash='dot')), row=1, col=1)
 
-    # Plotting Errors (MSE of full state)
+    # 2. Velocity
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_true[:, 1], mode='lines', name='True Vel', line=dict(color='green', width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_measured[:, 1], mode='markers', name='Measured', marker=dict(color='gray', size=2, opacity=0.3), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ekf[:, 1], mode='lines', name='EKF Vel', line=dict(color='red', width=1, dash='dash')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_ukf[:, 1], mode='lines', name='UKF Vel', line=dict(color='orange', width=1, dash='dashdot')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=h_pf[:, 1], mode='lines', name='PF Vel', line=dict(color='blue', width=1.5, dash='dot')), row=2, col=1)
+
+    # 3. MSE
     err_ekf = np.mean((h_true - h_ekf)**2, axis=1)
     err_ukf = np.mean((h_true - h_ukf)**2, axis=1)
     err_pf = np.mean((h_true - h_pf)**2, axis=1)
     
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_ekf, mode='lines', name=f'EKF MSE (Mean: {np.mean(err_ekf):.5f})', line=dict(color='red', width=1)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_ukf, mode='lines', name=f'UKF MSE (Mean: {np.mean(err_ukf):.5f})', line=dict(color='orange', width=1)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_pf, mode='lines', name=f'PF MSE (Mean: {np.mean(err_pf):.5f})', line=dict(color='blue', width=1)), row=2, col=1)
+    # Calculate the mean of the MSE after an initial transient period (e.g., first 100 steps)
+    transient_steps = 100
+    mean_ekf_mse = np.mean(err_ekf[transient_steps:])
+    mean_ukf_mse = np.mean(err_ukf[transient_steps:])
+    mean_pf_mse = np.mean(err_pf[transient_steps:])
+    
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_ekf, mode='lines', name=f'EKF MSE (Mean: {mean_ekf_mse:.5f})', line=dict(color='red', width=1)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_ukf, mode='lines', name=f'UKF MSE (Mean: {mean_ukf_mse:.5f})', line=dict(color='orange', width=1)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=err_pf, mode='lines', name=f'PF MSE (Mean: {mean_pf_mse:.5f})', line=dict(color='blue', width=1)), row=3, col=1)
+
+    # 4. Weights (Neuron 0)
+    w_norm_ekf = np.linalg.norm(h_ekf_w[:, 0, :], axis=1)
+    w_norm_ukf = np.linalg.norm(h_ukf_w[:, 0, :], axis=1)
+    w_norm_pf = np.linalg.norm(h_pf_w[:, 0, :], axis=1)
+
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=w_norm_ekf, mode='lines', name='EKF |W|', line=dict(color='red', width=1)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=w_norm_ukf, mode='lines', name='UKF |W|', line=dict(color='orange', width=1)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=np.arange(STEPS)*DT, y=w_norm_pf, mode='lines', name='PF |W|', line=dict(color='blue', width=1)), row=4, col=1)
 
     # Update layout
-    fig.update_layout(height=800, width=1000, title_text="Pendulum System Identification Results")
-    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
+    fig.update_layout(height=1200, width=1000, title_text="Pendulum System Identification: EKF vs UKF vs PF (Non-Gaussian Noise)")
+    fig.update_xaxes(title_text="Time (s)", row=4, col=1)
     fig.update_yaxes(title_text="Angle (rad)", row=1, col=1)
-    fig.update_xaxes(title_text="Time (s)", row=2, col=1)
-    fig.update_yaxes(title_text="MSE", row=2, col=1)
+    fig.update_yaxes(title_text="Vel (rad/s)", row=2, col=1)
+    fig.update_yaxes(title_text="MSE", type="log", row=3, col=1)
+    fig.update_yaxes(title_text="|W|", row=4, col=1)
 
     fig.show()
+    
+    print("\n=== Final Statistics ===")
+    print(f"EKF Mean MSE: {mean_ekf_mse:.6f}")
+    print(f"UKF Mean MSE: {mean_ukf_mse:.6f}")
+    print(f"PF Mean MSE: {mean_pf_mse:.6f}")
 
 if __name__ == "__main__":
     run_simulation()
